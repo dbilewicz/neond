@@ -24,6 +24,7 @@ use std::str::FromStr;
 use tempfile::TempDir;
 
 use crate::mgmt::service::logs::{LogChannel, LogStream, LogsService};
+use crate::utils::death;
 use crate::utils::stdout::wait_for_output_timeout;
 
 use crate::mgmt::model::branch::Branch;
@@ -61,6 +62,7 @@ pub struct ComputeEndpoint {
     preferred_port: Option<u16>,
     metrics_port: Option<u16>,
     pooler_port: Option<u16>,
+    preferred_pooler_port: Option<u16>,
     pid: Option<u32>,
     pgbouncer_pid: Option<u32>,
     compute_dir: TempDir,
@@ -85,6 +87,7 @@ impl ComputeEndpoint {
         branch: Branch,
         pg_version: PgVersion,
         preferred_port: Option<u16>,
+        preferred_pooler_port: Option<u16>,
         logs_service: Arc<LogsService>,
     ) -> Result<Self> {
         let pgdata_dir = TempDir::with_prefix(format!("compute_{}_", branch.timeline_id))
@@ -100,6 +103,7 @@ impl ComputeEndpoint {
             preferred_port,
             metrics_port: None,
             pooler_port: None,
+            preferred_pooler_port,
             pid: None,
             pgbouncer_pid: None,
             compute_dir: pgdata_dir,
@@ -160,19 +164,7 @@ impl ComputeEndpoint {
         let connection_string = format!("postgresql://cloud_admin@localhost:{}/postgres", port);
 
         let mut cmd = Command::new(&compute_ctl_binary);
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            unsafe {
-                cmd.pre_exec(|| {
-                    #[cfg(target_os = "linux")]
-                    libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM, 0, 0, 0);
-                    #[cfg(target_os = "macos")]
-                    libc::setpgid(0, 0);
-                    Ok(())
-                });
-            }
-        }
+        death::configure_death_signal(&mut cmd);
 
         let metrics_port =
             crate::utils::ports::allocate_random_port().map_err(|error| {
@@ -185,6 +177,9 @@ impl ComputeEndpoint {
         let pg_data_path = self.compute_dir.path().join("pg_data");
         let mut child = cmd
             .env_clear()
+            .env("OTEL_SDK_DISABLED", "true")
+            .env("MALLOC_ARENA_MAX", "2")
+            .env("MALLOC_MMAP_THRESHOLD_", "131072")
             .arg("--pgdata")
             .arg(path_str(&pg_data_path)?)
             .arg("--pgbin")
@@ -268,18 +263,10 @@ impl ComputeEndpoint {
 
         if let Err(e) = self.start_pgbouncer() {
             tracing::error!(
-                "Failed to start pgbouncer for compute endpoint {}: {}",
+                "Failed to start pgbouncer for compute endpoint {}, continuing without pooling: {}",
                 self.branch.timeline_id,
                 e
             );
-            if let Some(mut compute_child) = self.child.take() {
-                compute_child.kill().ok();
-                compute_child.wait().ok();
-            }
-            self.status = ComputeEndpointStatus::Failed;
-            self.pid = None;
-            self.metrics_port = None;
-            return Err(e);
         }
 
         self.status = ComputeEndpointStatus::Running;
@@ -309,11 +296,7 @@ impl ComputeEndpoint {
             reason: "postgres port not allocated before pgbouncer startup".to_string(),
         })?;
 
-        let pooler_port = crate::utils::ports::allocate_random_port().map_err(|error| {
-            AppError::ComputeProcessStartupFailed {
-                reason: format!("failed to allocate pooler port: {}", error),
-            }
-        })?;
+        let pooler_port = self.resolve_pooler_port()?;
         self.pooler_port = Some(pooler_port);
 
         let compute_dir = self.compute_dir.path();
@@ -367,19 +350,7 @@ impl ComputeEndpoint {
         })?;
 
         let mut cmd = Command::new(&pgbouncer_bin);
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            unsafe {
-                cmd.pre_exec(|| {
-                    #[cfg(target_os = "linux")]
-                    libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM, 0, 0, 0);
-                    #[cfg(target_os = "macos")]
-                    libc::setpgid(0, 0);
-                    Ok(())
-                });
-            }
-        }
+        death::configure_death_signal(&mut cmd);
 
         let mut child = cmd
             .env_clear()
@@ -429,7 +400,7 @@ impl ComputeEndpoint {
             }
         });
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         let address: std::net::SocketAddr = format!("127.0.0.1:{}", pooler_port)
             .parse()
             .map_err(|_| AppError::ComputeSocketAddressInvalid {
@@ -475,8 +446,12 @@ impl ComputeEndpoint {
             #[cfg(unix)]
             {
                 let pid = child.id() as i32;
-                unsafe {
-                    libc::killpg(pid, libc::SIGINT);
+                if unsafe { libc::killpg(pid, libc::SIGINT) } != 0 {
+                    tracing::warn!(
+                        "Failed to signal pgbouncer process group {}: {}",
+                        pid,
+                        std::io::Error::last_os_error()
+                    );
                 }
                 for _ in 0..50 {
                     match child.try_wait() {
@@ -524,8 +499,12 @@ impl ComputeEndpoint {
             {
                 let pid = child.id() as i32;
                 tracing::debug!("Sending SIGINT to compute process group: {}", pid);
-                unsafe {
-                    libc::killpg(pid, libc::SIGINT);
+                if unsafe { libc::killpg(pid, libc::SIGINT) } != 0 {
+                    tracing::warn!(
+                        "Failed to signal compute process group {}: {}",
+                        pid,
+                        std::io::Error::last_os_error()
+                    );
                 }
                 for _ in 0..50 {
                     match child.try_wait() {
@@ -709,6 +688,20 @@ impl ComputeEndpoint {
             }
             tracing::warn!(
                 "Preferred port {} for branch {} is unavailable, falling back to random port",
+                preferred,
+                self.branch.timeline_id
+            );
+        }
+        self.generate_random_port()
+    }
+
+    fn resolve_pooler_port(&self) -> Result<u16> {
+        if let Some(preferred) = self.preferred_pooler_port {
+            if std::net::TcpListener::bind(("127.0.0.1", preferred)).is_ok() {
+                return Ok(preferred);
+            }
+            tracing::warn!(
+                "Preferred pooler port {} for branch {} is unavailable, falling back to random port",
                 preferred,
                 self.branch.timeline_id
             );
@@ -918,6 +911,10 @@ impl Drop for ComputeEndpoint {
             || self.status == ComputeEndpointStatus::Starting
         {
             if let Some(mut child) = self.child.take() {
+                #[cfg(unix)]
+                unsafe {
+                    libc::killpg(child.id() as i32, libc::SIGKILL);
+                }
                 child.kill().ok();
                 child.wait().ok();
             }
